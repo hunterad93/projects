@@ -1,0 +1,512 @@
+---
+title: "BBQ Forecasting"
+output: 
+  html_document: 
+    toc: yes
+date: "2023-04-05"
+---
+
+```{r setup, include=FALSE}
+#change directory here to include folder with data files in it
+knitr::opts_chunk$set(echo = TRUE)
+setwd("/Users/adamhunter/Downloads/independent study final")
+```
+
+At the Notorious Pig, most menu items take hours (up to 20) to slow-smoke and so attempting to adjust "on the fly" is difficult, as such we have to make our predictions for how much will sell well in advance. This leads to occasional early closes due to lack of product to sell or waste when too much product is produced. Typically we make an intuitive prediction based on recent days' sales, the day's weather, and local events. The calculator which is the final product of this script is simply a way to make this type of prediction more consistent with actual coefficients assigned to different predictors rather than intuitive weights.
+
+The overall structure of the code is as follows. First, raw data is requested from the Clover API where the most recent 100,000 orders are stored in JSON, which includes orders through mid September of 2019. Second, this data is parsed and aggregated, with the output being a dictionary of days in which each day is a dictionary, containing meat types as keys and total weights for that day as values. Third, the dictionary is transformed into a dataframe and daily weather is merged. Fourth, the data is fit with a linear regression model, producing a series of coefficients associated with the predictors used. Fifth and finally an rshiny app is deployed which uses these coefficients and creates a simple UI which can be used to predict tomorrow's sales. Potential improvements for the script are discussed later in this document, but at its current stage it is likely to make better predictions than a human would for certain menu items on days without major local events.
+
+The code block below loads the libraries used later in the script. Httr is used to interact with the Clover Api and request raw data. Readxl is used to import a weather dataset. Zoo, Tidyverse, and dplyr are used in the parsing and aggregating of the data. Lastly, shiny is used for creating an app which is currently deployed on shiny.io and is used daily to predict sales for half chickens and ribs.
+
+```{r Libraries, message=FALSE, warning=FALSE}
+library(httr)
+library(tidyverse)
+library(dplyr)
+library(readxl)
+library(zoo)
+library(shiny)
+
+```
+
+The next section of code is the function which interacts with the API. It is necessary to create a loop making separate attempts at requesting small amounts of orders because the API limited how many orders could be requested. The function took three arguments, 'amount', 'tries', and 'wait'. 'Amount' refers to the total number of orders that are being requested. 'Tries' refers to the number of failed attempts that would occur in the loop before breaking. 'Wait' refers to the time that the loop would pause before another iteration after a failed request.
+
+The httr library's 'GET' function includes the argument to 'expand' certain items which is necessary to get all the data needed to find the total amounts of meats sold per day. It also included the 'offset' argument which took the x value which is the number of iterations that had happened so far, in order to find the place in the database to request the next 100 orders.
+
+```{r API Request}
+##comenting all this out so the markdown file will knit without failing due to no API key
+
+get_order <- function(amount, tries, wait){
+  x<-0
+  tries <- 0
+  # Use a loop to make requests for orders
+  orders <- list()
+
+  while (length(orders) < amount) {
+    response <- GET(url = "https://api.clover.com/v3/merchants/9RZR66B7RB9D4/orders",
+                    query = list(expand = "lineItems", expand = "lineItems.modifications", limit = 100, offset = (x*100)),
+                    accept_json(),
+                    add_headers(Authorization="Bearer <secret API key>")
+    )
+    x <- x + 1
+    if(tries > tries){
+      break
+    }
+    else if (length(content(response)$elements) == 0) {
+      tries <- tries + 1
+      Sys.sleep(wait)
+      next
+    } else {
+      orders <- c(orders, content(response)$elements)
+    }
+  }
+  return(orders)
+}
+#commenting function call out as it will fail due to no API key, example orders loaded below
+# recentorders <- get_order(1000,15,5)
+
+recentorders <- readRDS('recentorders.RDS')
+```
+The last 1000 orders loaded here as recentorders. Further below a fully parsed version of the data is loaded for the previous 100,000 orders. Requesting and parsing the full list of orders takes a few hours.
+
+The next section of code is a series of functions, these functions each have a role in parsing the transaction data from the clover API (recentorders) into the final product used in the LM. The product of calling these functions is a dictionary of days in which each day is a dictionary of meat types with weights as values. The daily high temp for each day is also included in these dictionaries to be used as another predictor of sales.
+
+Individual functions are explained with comments in the code.
+
+```{r Parsing}
+
+# This function takes a list of orders and extracts item names, modifications,
+# and order dates from each order, creating a new list for each item.
+# the list resulting from this called "list of item lists" is a list where the first element is
+# the item name and subsequent elements are modifications associated with that item.
+#for example one element might be something like [Brisket sandwich, Biggie, Mac and Cheese, Sweet, NO PW]
+parse_orders <- function(orders) {
+  # Initializing lists for the loops
+  list_for_item <- list()
+  list_of_item_lists <- list()
+  mod_list <- list()
+
+  # Add a standard date to each order
+  for (i in 1:length(orders)){
+    orders[[i]]$order_date <- format(as.POSIXct(orders[[i]]$createdTime/1000, origin="1970-01-01", tz="America/Denver"), format = "%Y-%m-%d")
+  }
+
+  # Loop through the orders
+  for (i in 1:length(orders)) {
+    order <- orders[[i]]
+
+    # Loop through the items in each order
+    for (j in 1:length(order$lineItems$elements)) {
+      # Sets the current item within the list of orders
+      item <- order$lineItems$elements[[j]]
+      # Creates a variable for the name of the current item, rewriting last
+      item_name <- item$name
+
+      # Handling null item names
+      if (is.null(item_name) || item_name == "") {
+        item_name <- "NULL"
+      }
+
+      # Loop through the modifications in each item
+      for (l in 1:length(item$modifications$elements)) {
+        # Assign the current modification
+        modifications <- item$modifications$elements[[l]]
+        # Reference the modification name
+        mod_name <- modifications$name
+
+        # Handling null modification names
+        if (is.null(mod_name) || mod_name == "") {
+          mod_name <- "NULL"
+        }
+
+        # Add current modification to the list for the current item
+        mod_list <- append(mod_list, mod_name)
+      }
+
+      # Add the name of the current item as the first element in the modification list
+      list_for_item <- c(item_name, list(mod_list), orders[[i]]$order_date, item$unitQty)
+      list_of_item_lists <- append(list_of_item_lists, list(list_for_item))
+
+      # Reset the list of modifications after adding to the list that associates item names with modifications
+      mod_list <- list()
+
+      # Reset the list with the item as the first element
+      list_for_item <- list()
+    }
+  }
+  
+  return(list_of_item_lists)
+}
+
+# This function goes through the "list of item lists" and separates them by day
+list_seperator <- function(orders){
+  daily_list <- list()
+  for (daysorts in 1:length(orders)){
+    listitem <- orders[[daysorts]]
+
+    # Check if the day is in the list
+    if (listitem[[3]] %in% names(daily_list)) {
+      # If it is, concatenate the list item into that list
+      daily_list[[listitem[[3]]]] <- c(daily_list[[listitem[[3]]]], list(listitem))
+    } else {
+      # If it doesn't, create a new entry in the list with the item
+      daily_list[[listitem[[3]]]] <- list(listitem)
+    }
+  }
+  return(daily_list)
+}
+
+# Function to check the amount of meat in an item. This outputs a list as long as the list of item lists where each
+# element is simply a number that refers to the weight in ounces associated with that item
+# for example with the example list above: [Brisket sandwich, Biggie, Mac and Cheese, Sweet, NO PW]
+# the output would simply be '7/16', which is the number of ounces/16 (to get pounds) in a Biggie sandwich
+check_amount <- function(listofmods) {
+  if (listofmods[[1]] == "PICK 2") {
+    return(4.5/16)
+  }
+  if (any(grepl("Combo", listofmods[[1]], ignore.case = TRUE))) {
+    return(4/16)
+  } else if (listofmods[[1]] == "BBQ SALAD") {
+    return(4/16)
+  } else if (listofmods[[1]] == "#4 EZ CARRYOUT COMBINATIONS") {
+    return(16/16)
+  } else if (listofmods[[1]] == "PIT MASTER PLATTER") {
+    return(8/16)
+  } else if (grepl("PLATE", listofmods[[1]], ignore.case = TRUE)) {
+    return(9/16)
+  } else if (listofmods[[2]][[1]] == "SMALLS") {
+    return(5/16)
+  } else if (listofmods[[2]][[1]] == "BIGGIE") {
+    return(7/16)
+  } else {
+    return(0)
+  }
+}
+
+# Function to check the type of meat in an item. This outputs another list of equal length to the previous 
+# list where each element is a meat type. So the output for the example would be 'BRISKET'.
+#The grepl function with ignore.case is used as different items list their meats with different
+#punctuation, hyphenation, case etc.
+check_meat <- function(listofmods) {
+  meat_list <- list()
+  for (i in (1:length(listofmods))) {
+    if (any(grepl("BRISKET", listofmods[[i]], ignore.case = TRUE))) {
+      meat_list <- c(meat_list, "BRISKET")
+    }
+    if (any(grepl("PULLED", listofmods[[i]], ignore.case = TRUE))) {
+      meat_list <- c(meat_list, "PULLED PORK")
+    }
+    if (any(grepl("ENDS", listofmods[[i]], ignore.case = TRUE))) {
+      meat_list <- c(meat_list, "ENDS")
+    }
+    if (any(grepl("TURK", listofmods[[i]], ignore.case = TRUE))) {
+      meat_list <- c(meat_list, "TURKEY")
+    }
+    if (any(grepl("TIP", listofmods[[i]], ignore.case = TRUE))) {
+      meat_list <- c(meat_list, "TRI-TIP")
+    }
+  }
+
+  return(meat_list)
+}
+
+# Function to count items sold by quantity rather than weights like chicken and ribs. This simply counts
+# the instances of relevant key words in the list of item lists. Half slabs of ribs are listed in two different ways
+# requiring a check for both "HALF" and "1/2 S" as in 1/2 slab.
+bone_counts <- function(bone_list) {
+  chicken_counter <- 0
+  slab_counter <- 0
+  for (item in bone_list) {
+    if (grepl("1/2 C", item[[1]]) || any(grepl("1/2 C", item[[2]]))) {
+      chicken_counter <- chicken_counter + 1
+    }
+    if (grepl("FULL", item[[1]]) || any(grepl("FULL", item[[2]]))) {
+      slab_counter <- slab_counter + 1
+    }
+    if (grepl("HALF", item[[1]]) || any(grepl("HALF", item[[2]]))) {
+      slab_counter <- slab_counter + 0.5
+    }
+    if (grepl("1/2 S", item[[1]]) || any(grepl("1/2 S", item[[2]]))) {
+      slab_counter <- slab_counter + 0.5
+    }
+  }
+  return(list("Chickens" = chicken_counter, "Ribs" = slab_counter))
+}
+
+# Function to combine check_amount, check_meat, and bone_counts results. The 'meat_amounts' and 'meat_types' lists
+# are of equal length creating the dictionary with meat_types as keys and meat_amounts as values. Then
+# 'bone_counts' are added in at the end.
+combine_lists <- function(orderlist) {
+  # Get meat weights per order
+  meat_amounts <- sapply(orderlist, check_amount)
+  # Get meat types per order
+  meat_types <- sapply(orderlist, check_meat)
+
+  # Initialize a list for combining meat types and weights
+  combinedlist <- list("PULLED PORK"=0, "BRISKET"=0, "TRI-TIP"=0, "ENDS"=0, "TURKEY"=0, "null"=0)
+  for (i in 1:length(meat_types)) {
+    order <- meat_types[[i]]
+    amount <- meat_amounts[[i]]
+    if (length(order) < 1){order <- "null"}
+
+    for(j in 1:length(order)){
+      meat <- order[[j]]
+
+      # Check if the item already exists in the list
+      if (meat %in% names(combinedlist)) {
+        # If it does, add the amount to the existing total
+        combinedlist[[meat]] <- combinedlist[[meat]] + amount
+      } else {
+        # If it doesn't, create a new entry in the list with the amount
+        combinedlist[[meat]] <- amount
+      }
+    }
+  }
+  combinedlist <- c(combinedlist, bone_counts(orderlist))
+
+  return(combinedlist)
+}
+
+# Parse and process the orders using functions created above.
+parsed <- parse_orders(recentorders)
+separated <- list_seperator(parsed)
+final_list <- lapply(separated, combine_lists)
+```
+
+The next section of code loads the full list of parsed orders (overwriting the final_list produced above with the set of 1000 orders) and weather data, then joins them by date.
+
+```{r Joining Weather Data}
+
+final_list <- readRDS('final_list.RDS')
+#Reads in weather data for each day
+daily_weather <- as.data.frame(read_excel("weather_data_2.xlsx"))
+#date format for date column
+daily_weather$day <- as.Date(daily_weather$day)
+#adds weather data into dictionary where dates match
+for (date in names(final_list)) {
+  date_rows <- which(daily_weather$day == date)
+  final_list[[date]] <- c(final_list[[date]], daily_weather[date_rows, "max_temp_f"])
+}
+
+```
+
+In the next section of code the dictionary of days is converted into a dataframe, then Sundays are removed from the data frame as they are half-days at the PIG and cause models to over-value the same day last week. After this the data is manipulated into a form that is easier to load into the LM. Each day being predicted is given its own row with the actual amounts and all predictors included in that row for all meat types.
+
+A note regarding the weather data: after trying lots of predictors and combinations of predictors like humidity, wind, precipitation etc., daily high preformed best.
+
+```{r Transforming Data to Load Into LM}
+
+# Convert the dictionary to a data frame
+sales_df <- data.frame(do.call(rbind, final_list))
+# Add a column for the date from the keys of the dictionary
+sales_df$date <- names(final_list)
+#format date as a date type
+sales_df$date <- as.Date(sales_df$date)
+colnames(sales_df)[9] <- "high" #renaming high temp
+
+#creates a column with day of week to remove sundays
+sales_df$day_of_week <- weekdays(sales_df$date)
+
+#removed sundays as they are half days, including sundays inappropriately increases significance of same day last week as predictor.
+sales_df <- sales_df[format(sales_df$date, "%A") != "Sunday", ]
+
+#this function makes a df with each row having meat totals for 7 day period
+#starting with today. so the lm references a single row with lag_1 as day being predicted and 2-7
+#as 6 days prior. Creating the window size argument is very useful to easily test different parameters.
+#Increasing window size beyond 1 week appeared to be overfitting the data.
+generate_predictors <- function(df, date_col, value_cols, window_size) 
+{
+  # Sort the data frame by the date column
+  df <- df[order(df[[date_col]]), ]
+  
+  # Initialize a matrix to hold the predictors
+  num_rows <- nrow(df) - window_size + 1
+  num_cols <- window_size * length(value_cols)
+  predictors <- matrix(NA, nrow = num_rows, ncol = num_cols)
+  predictornames <- vector(length = 0)
+  for (j in 1:window_size) {
+    predictornames <- c(predictornames,(paste0(value_cols, "_lag",j)))
+  }
+  colnames(predictors) <- predictornames
+  
+  # Loop through each row in the data frame
+  for (i in 1:num_rows) {
+    # Extract the sales data for the past `window_size` days
+    sales <- df[(i:(i + window_size - 1)), value_cols]
+    
+    # Flatten the sales data into a vector
+    sales <- unlist(as.vector(t(sales)))
+    
+    # Add the sales data as a row in the predictors matrix
+    predictors[i, ] <- sales
+  }
+  
+  return(predictors)
+}
+
+# Generate predictors for each day using the above function.
+predictors_df <- as.data.frame(generate_predictors(sales_df, "date", c("PULLED.PORK", "BRISKET", "TRI.TIP", "ENDS", "TURKEY", "null", "Chickens", "Ribs", "high"), 7))
+
+```
+
+Once the predictors df has been created above, the following snippet fits linear models according to chosen predictors. A separate model for each type of meat is created. An 'advanced model' for each meat includes all the days of the last week while the basic model for each meat includes only yesterday and the same day last week. I chose to create both types of models so that the dashboard would have multiple options according to what PIG managers wanted.
+
+```{r Fitting Models}
+#linear model generator, you pick exact factors to include as predictors when defining function
+#this is used later to create the basic model with only day before and week before
+#when calling function, data and meat type is specified
+model_generator_manual <- function(data, meat){
+  formula <- as.formula(paste0(meat,"_lag1 ~ ", meat, "_lag2 + ", meat, "_lag6"))
+  fit <- lm(formula = formula, data = data)
+  return(fit)
+}
+
+#linear model generator, allowing flexibility in choosing time window to examine
+#I used this to test looking at longer time windows but there are diminishing returns after
+#the first week, so looking at a single week appears most parsimonious and avoids overfitting.
+model_generator_auto <- function(data, meat, num_predictors){
+  weatherdata <- vector(length = 0)
+  meattotaldata <- vector(length = 0)
+  dependent <- paste0(meat,"_lag1")
+  for (i in 2:(num_predictors-1)) {
+    meattotaldata <- paste0(meattotaldata, paste0(meat, "_lag", i, " + "))
+  }
+  weatherdata <- paste0("high_lag1 + ") 
+  meattotaldata <- paste0(meattotaldata, meat, "_lag", num_predictors)
+  formula <- as.formula(paste0(dependent, " ~ ", weatherdata, meattotaldata))
+  fit <- lm(formula = formula, data = data)
+  return(fit)
+} 
+num_predictors <- 6
+#view auto models, pick number of days to look at
+summary(model_generator_auto(predictors_df, "BRISKET", num_predictors))
+summary(model_generator_auto(predictors_df, "PULLED.PORK", num_predictors))
+summary(model_generator_auto(predictors_df, "Ribs", num_predictors))
+summary(model_generator_auto(predictors_df, "Chickens", num_predictors))
+summary(model_generator_auto(predictors_df, "TRI.TIP", num_predictors))
+summary(model_generator_auto(predictors_df, "TURKEY", num_predictors))
+summary(model_generator_auto(predictors_df, "ENDS", num_predictors))
+
+modellist <- list()
+#simple model for dashboard based on just yesterday + last week
+modellist[[1]] <- model_generator_manual(predictors_df, "BRISKET")
+modellist[[2]] <- model_generator_manual(predictors_df, "PULLED.PORK")
+modellist[[3]] <- model_generator_manual(predictors_df, "TRI.TIP")
+modellist[[4]] <- model_generator_manual(predictors_df, "Chickens")
+modellist[[5]] <- model_generator_manual(predictors_df, "Ribs")
+modellist[[6]] <- model_generator_manual(predictors_df, "TURKEY")
+names(modellist) <- c("BRISKET", "PULLED PORK", "TRI TIP", "Chickens", "Ribs", "TURKEY")
+
+
+bigmodellist <- list()
+#advanced model for dashboard based on all of the previous week and precited high temp
+bigmodellist[[1]] <- model_generator_auto(predictors_df, "BRISKET", 6)
+bigmodellist[[2]] <- model_generator_auto(predictors_df, "PULLED.PORK", 6)
+bigmodellist[[3]] <- model_generator_auto(predictors_df, "TRI.TIP", 6)
+bigmodellist[[4]] <- model_generator_auto(predictors_df, "Chickens", 6)
+bigmodellist[[5]] <- model_generator_auto(predictors_df, "Ribs", 6)
+bigmodellist[[6]] <- model_generator_auto(predictors_df, "TURKEY", 6)
+names(bigmodellist) <- c("BRISKET", "PULLED PORK", "TRI TIP", "Chickens", "Ribs", "TURKEY")
+```
+
+The 'modellist' and 'bigmodellist' are used to provide coefficients and R-squared values for the dashboard created in the next code snippet. The dashboard requires the user to input the most recent sales.
+
+The benefit of entering the last weeks' data manually rather than updating it via API call is that the user can distinguish between catering orders and 'foot-traffic' orders through our on-paper tracking system. This distinction does not exist in the clover database.
+
+Through making that distinction, the user can enter recent foot-traffic meat totals as the last week of data, and input these into the calculator to predict next-day foot traffic orders. Different data collection practices that created a distinction between catering and non-catering orders in the database would make it possible for this calculator to work without input.
+
+The next snippet of code creates an rshiny app calculator using the coefficients and intercepts discovered by the script based on historical data. A UI receives the foot-traffic totals for the recent days as well as the high temp predicted for the day, and the server uses the coefficients to output a prediction. This prediction is increased by 15% as management prefers to cook too much rather than not cooking enough.
+
+```{r Shiny App}
+# Define UI
+ui <- fluidPage(
+  
+  # Define a tabsetPanel with two tabs
+  tabsetPanel(
+    # First tab
+    tabPanel("Basic",
+             h1("Basic"),
+             selectInput("model", "Select a meat:",
+                         choices = c("BRISKET", "PULLED PORK", "TRI TIP", "Chickens", "Ribs", "TURKEY"), selected = "BRISKET"),
+             numericInput("lastweek", "Sold last week same day, subtract preorders", value = 25),
+             numericInput("yesterday", "Sold previous day, subtract preorder, skip sundays", value = 25),
+             textOutput("result")
+    ),
+    
+    # Second tab
+    tabPanel("Advanced",
+             h1("Advanced"),
+             selectInput("advmodel", "Select a meat:",
+                         choices = c("BRISKET", "PULLED PORK", "TRI TIP", "Chickens", "Ribs", "TURKEY"), selected = "BRISKET"),
+             numericInput("lag_6", "Day 6 (same day last week)", value = 25),
+             numericInput("lag_5", "Day 5", value = 25),
+             numericInput("lag_4", "Day 4", value = 25),
+             numericInput("lag_3", "Day 3", value = 25),
+             numericInput("lag_2", "Day 2 (skip sundays)", value = 25),
+             numericInput("high", "Day's predicted high", value = 75),
+             textOutput("advresult")
+    )
+  )
+)
+
+# Define server
+server <- function(input, output) {
+  
+  calc_prediction <- function(model, lastweek, yesterday) {
+    #lm equation referencing coefficients and intercept from selected model
+    prediction <- coef(model)[[1]] + coef(model)[[2]] * yesterday + coef(model)[[3]] * lastweek
+    return(prediction)
+  }
+  
+  
+  # Define reactive values
+  lastweek <- reactive({input$lastweek})
+  model <- reactive({input$model})
+  yesterday <- reactive({input$yesterday})
+  rsq <- reactive({summary(modellist[[input$model]])$r.squared})
+  # Update text output using lm equation referencing reactive values
+  output$result <- renderText({paste("Amount predicted before adding pre orders",
+                                     (1.15*(calc_prediction(modellist[[model()]],lastweek(),yesterday()))), "accuracy estimation = ", round(rsq(),2), sep = " ")
+    
+  })
+  
+  calc_adv_prediction <- function(advmodel, lag_6, lag_5, lag_4, lag_3, lag_2, high) {
+    #lm equation referencing coefficients from selected model
+    prediction <- coef(advmodel)[[1]] +
+      coef(advmodel)[[2]] * high +
+      coef(advmodel)[[3]] * lag_2 +
+      coef(advmodel)[[4]] * lag_3 + 
+      coef(advmodel)[[5]] * lag_4 + 
+      coef(advmodel)[[6]] * lag_5 + 
+      coef(advmodel)[[7]] * lag_6
+    return(prediction)
+  }
+  
+  # Define reactive values
+  rsqadv <- reactive({summary(bigmodellist[[input$advmodel]])$r.squared})
+  calc <- reactive({calc_adv_prediction(bigmodellist[[input$advmodel]], input$lag_6, input$lag_5, input$lag_4, input$lag_3
+                                        , input$lag_2, input$high)})
+  # Update text output using lm equation referencing reactive values
+  output$advresult <- renderText({paste("Amount predicted before adding pre orders",
+                                        (1.15*(calc())), "accuracy estimation = ", round(rsqadv(),2), sep = " ")
+  })
+}
+# Run the app
+shinyApp(ui, server)
+
+```
+
+The calculator is currently accessible at https://8pat7m-adam-hunter.shinyapps.io/pigcalc2. It is being used daily for the chicken and rib predictions. The calculator is not being used with other meat-types for several reasons. Firstly, because the predictions are less accurate with lower R-squared values. This indicates that sales of these meats is less predictable in general. Notably, weather as a predictor has a lower p-value with these relatively unpredictable meats. I'd hypothesize that this is due to the fact that these meats (brisket, pulled pork, tri-tip, turkey, and burnt ends) are typically ordered in big groups whose behavior is more influenced by weather and downtown events.
+
+Secondly with the predictions of these meats being in pounds rather than counts, users need to do math and weight estimation of meat sizes. Additionally, as they are entering in the on-paper foot-traffic data which is written in meat counts (e.g. how many brisket rather than how many pounds of brisket) they need to assume a yield in pounds per meat item. As the cuts vary greatly in size, this assumption is likely to be incorrect frequently.
+
+Without different data-collection practices, predicting these meat types is better left to the intuitive calculations of managers. Using the calculator for these meats is likely to decrease trust in its predictions and hinder adoption. Additionally, predicting these meat types is of less importance because they lend themselves better to being made into specials the next day like chili or turkey salad.
+
+Reflecting on initial efforts at implementing the calculator it seems that the primary benefit of it is that it helps reduce the effect of emotion on predictions. Stress frequently leads to over-cooking and this stress is often not directly due to increased business. So far the overall effect of the calculator has been to lower average predictions, and these lower predictions have been more accurate on average than they had been in the past.
+
+Potential improvements to the calculator would include the following:
+
+1. With better data collection practices that created distinctions between foot traffic and pre-orders in the Clover database, predictions could be based on recent data from API calls rather than manual entry of recent data. This practice would also allow for prediction of other meat-types because accurate data (foot-traffic only) in pounds would be accessible.
+
+2. Separate lms for each day of the week might be worth exploring. Currently the model predicts based on coefficients for recent days, and the same day last week is always the highest coefficient and lowest p-value. The relationship between the predictor days in the time window and the predicted day is likely slightly different on different days of the week however. Distinct lms could be generated for each type of meat on each day of the week.
+
+3. The calculator could be updated to suggest meat amounts differently dependent on their margin. For example, turkey is the lowest-margin item, and as such we often cook less than we think we will sell, making up the difference with higher margin items like pulled pork and tri-tip. This strategy allows us to balance the goals of maintaining a diverse menu, keeping costs down, and closing early as rarely as possible. Just as with the creation of the calculator, the intuitive strategy already in place could be formalized and data-driven by factoring in specific margins with the calculator.
